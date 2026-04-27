@@ -1,0 +1,266 @@
+*Final Code*
+
+#include <MCUFRIEND_kbv.h>
+#include <Adafruit_GFX.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <math.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+
+MCUFRIEND_kbv tft;
+RTC_DS3231 rtc;
+
+// GPS
+TinyGPSPlus gps;
+SoftwareSerial gpsSerial(10, 11);
+
+#define BLACK 0x0000
+#define WHITE 0xFFFF
+#define CYAN  0x07FF
+
+#define VALUE_X 140
+
+float lat = 13.0827;
+float lon = 80.2707;
+float tz = 5.5;
+
+int prevSec = -1;
+float prevRise=-1, prevSet=-1;
+float prevRahu=-1, prevYama=-1, prevGuli=-1;
+
+// ---------- Utility ----------
+float degToRad(float v){ return v * PI / 180.0; }
+
+// ---------- GPS → RTC SYNC ----------
+void syncRTCwithGPS() {
+  if (gps.time.isValid() && gps.date.isValid()) {
+
+    int year = gps.date.year();
+    int month = gps.date.month();
+    int day = gps.date.day();
+
+    int hour = gps.time.hour();
+    int minute = gps.time.minute();
+    int second = gps.time.second();
+
+    // UTC → IST
+    minute += 30;
+    hour += 5;
+
+    if (minute >= 60) {
+      minute -= 60;
+      hour++;
+    }
+
+    if (hour >= 24) {
+      hour -= 24;
+      day++;
+    }
+
+    rtc.adjust(DateTime(year, month, day, hour, minute, second));
+    Serial.println("RTC Synced with GPS!");
+  }
+}
+
+// ---------- HIGH ACCURACY SUN ----------
+float calcSunTime(int y,int m,int d,float lat,float lon,bool sunrise){
+
+  int A = (14 - m)/12;
+  int Y = y + 4800 - A;
+  int M = m + 12*A - 3;
+
+  float Jday = d + ((153*M + 2)/5) + 365*Y + Y/4 - Y/100 + Y/400 - 32045;
+
+  float n = Jday - 2451545.0 + 0.0008;
+  float Jstar = n - lon/360.0;
+
+  float Msol = fmod((357.5291 + 0.98560028 * Jstar),360.0);
+
+  float C = 1.9148*sin(degToRad(Msol))
+          + 0.0200*sin(degToRad(2*Msol))
+          + 0.0003*sin(degToRad(3*Msol));
+
+  float lambda = fmod((Msol + C + 180 + 102.9372),360.0);
+
+  float Jtransit = 2451545.0 + Jstar
+                 + 0.0053*sin(degToRad(Msol))
+                 - 0.0069*sin(degToRad(2*lambda));
+
+  float delta = asin(sin(degToRad(lambda))*sin(degToRad(23.44)));
+
+  float cosH = (sin(degToRad(-0.833)) - sin(degToRad(lat))*sin(delta)) /
+               (cos(degToRad(lat))*cos(delta));
+
+  if(cosH > 1 || cosH < -1) return -1;
+
+  float H = acos(cosH);
+
+  float Jrise = Jtransit - (H/(2*PI));
+  float Jset  = Jtransit + (H/(2*PI));
+
+  float Jfinal = sunrise ? Jrise : Jset;
+
+  float dayFraction = Jfinal - floor(Jfinal);
+  float timeUTC = dayFraction * 24.0;
+
+  float localTime = timeUTC + tz;
+
+  if(localTime < 0) localTime += 24;
+  if(localTime >= 24) localTime -= 24;
+
+  if(sunrise && localTime > 12) localTime -= 12;
+  if(!sunrise && localTime < 12) localTime += 12;
+
+  return localTime * 60.0;
+}
+
+// ---------- Panchang ----------
+void calcBlock(float rise,float setT,int day,int type,float &start,float &end){
+  float duration = setT - rise;
+  if(duration < 0) duration += 1440;
+
+  float part = duration / 8.0;
+
+  int idx;
+  if(type==0){ int m[]={7,1,6,4,5,3,2}; idx=m[day]; }
+  else if(type==1){ int m[]={4,3,2,1,0,6,5}; idx=m[day]; }
+  else{ int m[]={6,5,4,3,2,1,0}; idx=m[day]; }
+
+  start = rise + idx*part;
+  end   = start + part;
+}
+
+// ---------- PRINT ----------
+void printSingleTime(int y,float t){
+  int h=((int)t/60+24)%24;
+  int m=((int)t%60+60)%60;
+
+  tft.fillRect(VALUE_X,y,140,20,BLACK);
+  tft.setCursor(VALUE_X,y);
+  tft.setTextColor(WHITE,BLACK);
+  tft.setTextSize(2);
+
+  if(h<10) tft.print("0");
+  tft.print(h); tft.print(":");
+  if(m<10) tft.print("0");
+  tft.print(m);
+}
+
+void printTimePair(int y,float s,float e){
+  int sh=((int)s/60+24)%24;
+  int sm=((int)s%60+60)%60;
+  int eh=((int)e/60+24)%24;
+  int em=((int)e%60+60)%60;
+
+  tft.fillRect(VALUE_X,y,170,20,BLACK);
+  tft.setCursor(VALUE_X,y);
+  tft.setTextColor(WHITE,BLACK);
+  tft.setTextSize(2);
+
+  if(sh<10) tft.print("0");
+  tft.print(sh); tft.print(":");
+  if(sm<10) tft.print("0");
+  tft.print(sm);
+
+  tft.print("-");
+
+  if(eh<10) tft.print("0");
+  tft.print(eh); tft.print(":");
+  if(em<10) tft.print("0");
+  tft.print(em);
+}
+
+// ---------- SETUP ----------
+void setup(){
+  Serial.begin(9600);
+  gpsSerial.begin(9600);
+
+  // 🔥 FORCE TFT DRIVER (FIXED)
+  tft.begin(0x9341);
+  tft.setRotation(1);
+  tft.fillScreen(BLACK);
+
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+
+  tft.setCursor(10,10);  tft.print("Time:");
+  tft.setCursor(10,40);  tft.print("Date:");
+  tft.setCursor(10,80);  tft.print("Sunrise:");
+  tft.setCursor(10,110); tft.print("Sunset:");
+  tft.setCursor(10,140); tft.print("Rahu:");
+  tft.setCursor(10,170); tft.print("Yama:");
+  tft.setCursor(10,200); tft.print("Guli:");
+
+  Wire.begin();
+  rtc.begin();
+}
+
+// ---------- LOOP ----------
+void loop(){
+
+  while(gpsSerial.available()) gps.encode(gpsSerial.read());
+
+  if(gps.location.isValid()){
+    lat = gps.location.lat();
+    lon = gps.location.lng();
+  }
+
+  // GPS auto sync (only once)
+  static bool synced = false;
+  if (!synced && gps.time.isValid() && gps.date.isValid()) {
+    syncRTCwithGPS();
+    synced = true;
+  }
+
+  DateTime now = rtc.now();
+
+  // TIME
+  if(now.second()!=prevSec){
+    prevSec = now.second();
+
+    tft.fillRect(VALUE_X,10,120,25,BLACK);
+    tft.setTextColor(CYAN,BLACK);
+    tft.setTextSize(3);
+    tft.setCursor(VALUE_X,10);
+
+    if(now.hour()<10) tft.print("0");
+    tft.print(now.hour()); tft.print(":");
+    if(now.minute()<10) tft.print("0");
+    tft.print(now.minute()); tft.print(":");
+    if(now.second()<10) tft.print("0");
+    tft.print(now.second());
+  }
+
+  // DATE
+  tft.fillRect(VALUE_X,40,140,20,BLACK);
+  tft.setTextColor(WHITE, BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(VALUE_X,40);
+
+  if(now.day()<10) tft.print("0");
+  tft.print(now.day()); tft.print("/");
+
+  if(now.month()<10) tft.print("0");
+  tft.print(now.month()); tft.print("/");
+
+  tft.print(now.year());
+
+  // SUN TIMES
+  float rise = calcSunTime(now.year(),now.month(),now.day(),lat,lon,true);
+  float setT = calcSunTime(now.year(),now.month(),now.day(),lat,lon,false);
+
+  if(rise!=prevRise){ prevRise=rise; printSingleTime(80,rise); }
+  if(setT!=prevSet){ prevSet=setT; printSingleTime(110,setT); }
+
+  float rs,re,ys,ye,gs,ge;
+  calcBlock(rise,setT,now.dayOfTheWeek(),0,rs,re);
+  calcBlock(rise,setT,now.dayOfTheWeek(),1,ys,ye);
+  calcBlock(rise,setT,now.dayOfTheWeek(),2,gs,ge);
+
+  if(rs!=prevRahu){ prevRahu=rs; printTimePair(140,rs,re); }
+  if(ys!=prevYama){ prevYama=ys; printTimePair(170,ys,ye); }
+  if(gs!=prevGuli){ prevGuli=gs; printTimePair(200,gs,ge); }
+
+  delay(500);
+}
